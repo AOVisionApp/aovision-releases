@@ -1,0 +1,399 @@
+name: Publish AOVision privacy release
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: Exact approved migration phrase from the reviewed plan
+        required: true
+        type: string
+      backup_attestation:
+        description: SHA256 attestation of the verified local backup set
+        required: true
+        type: string
+      staging_release_name:
+        description: Exact private staging draft title
+        required: true
+        default: AOVision 1.2.5 — Private publishing stage
+        type: string
+      expected_head:
+        description: Exact reviewed main SHA containing this workflow
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: aovision-release-privacy-migration
+  cancel-in-progress: false
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PRIVACY_APPROVAL: ${{ inputs.approval }}
+      PRIVACY_BACKUP_ATTESTATION: ${{ inputs.backup_attestation }}
+      PRIVACY_STAGING_RELEASE_NAME: ${{ inputs.staging_release_name }}
+      PRIVACY_EXPECTED_HEAD: ${{ inputs.expected_head }}
+    steps:
+      - name: Apply the explicitly approved privacy migration
+        shell: bash
+        run: |
+          cat > privacy-migration.cjs <<'AOVISION_MIGRATION_CODE'
+          'use strict';
+          
+          // This one-time tool is intentionally inert unless all reviewed approval inputs match.
+          // No DELETE endpoint is used. Old release assets remain available to maintainers as drafts.
+          const assert = require('node:assert/strict');
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const fsp = require('node:fs/promises');
+          const os = require('node:os');
+          const path = require('node:path');
+          const { Readable, Transform } = require('node:stream');
+          const { pipeline } = require('node:stream/promises');
+          const { execFileSync } = require('node:child_process');
+          
+          const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
+          const stableRefs = refs => refs.map(r => ({ ref: r.ref, sha: r.object.sha, type: r.object.type }))
+            .sort((a, b) => a.ref.localeCompare(b.ref));
+          const releaseSnapshot = r => ({
+            id: r.id, tag_name: r.tag_name, target_commitish: r.target_commitish,
+            name: r.name, body: r.body, draft: r.draft, prerelease: r.prerelease,
+            immutable: !!r.immutable, authorId: r.author.id,
+            assets: r.assets.map(a => ({ id: a.id, name: a.name, size: a.size, digest: a.digest,
+              state: a.state, uploaderId: a.uploader.id })).sort((a, b) => a.name.localeCompare(b.name))
+          });
+          
+          async function main() {
+            assert.equal(process.argv[2], '--apply', 'Explicit --apply is required');
+            const plan = JSON.parse(await fsp.readFile(process.argv[3], 'utf8'));
+            assert.equal(plan.schemaVersion, 1, 'Unsupported reviewed plan');
+            const { attestationSha256, ...backupParts } = plan.backup;
+            assert.equal(sha256(JSON.stringify(backupParts)), attestationSha256, 'Reviewed backup metadata is inconsistent');
+            assert.equal(process.env.GITHUB_REPOSITORY, plan.repository, 'Wrong repository');
+            assert.equal(process.env.PRIVACY_APPROVAL, plan.approvalPhrase, 'Approval phrase mismatch');
+            assert.equal(process.env.PRIVACY_BACKUP_ATTESTATION, plan.backup.attestationSha256, 'Backup attestation mismatch');
+            const expectedHead = process.env.PRIVACY_EXPECTED_HEAD || '';
+            assert.match(expectedHead, /^[0-9a-f]{40}$/, 'Expected bootstrap HEAD is required');
+            assert.equal(process.env.GITHUB_SHA, expectedHead, 'Workflow commit differs from reviewed HEAD');
+            assert.equal(process.env.GITHUB_REF, `refs/heads/${plan.branch}`, 'Run must use the reviewed main branch');
+            assert.equal(process.env.PRIVACY_STAGING_RELEASE_NAME, plan.stagingReleaseName, 'Staging draft title mismatch');
+            assert.ok(process.env.GH_TOKEN, 'Repository-scoped GitHub token is required');
+            assert.equal(plan.backup.verifiedAssetCount, 21, 'Complete legacy asset backup is required');
+            assert.equal(plan.legacyReleases.length, 7, 'Unexpected legacy release set');
+            assert.equal(plan.artifacts.length, 3, 'Unexpected new artifact set');
+            const repo = plan.repository;
+            const apiRoot = `https://api.github.com/repos/${repo}`;
+            const headers = { Authorization: `Bearer ${process.env.GH_TOKEN}`,
+              Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+            let stage = 'preflight';
+            const api = async (route, method = 'GET', body, expectedStatus) => {
+              const response = await fetch(apiRoot + route, { method, headers: body === undefined ? headers :
+                { ...headers, 'Content-Type': 'application/json' },
+                ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+              if (expectedStatus) assert.equal(response.status, expectedStatus, `Unexpected HTTP status during ${stage}`);
+              else assert.ok(response.ok, `GitHub request failed (${response.status}) during ${stage}`);
+              if (response.status === 204 || expectedStatus === 404) return null;
+              return response.json();
+            };
+            const getRefs = () => api('/git/refs');
+            const assertBaselineRefs = (refs, addedTagSha) => {
+              const normalized = stableRefs(refs);
+              const mainRef = normalized.find(r => r.ref === `refs/heads/${plan.branch}`);
+              assert.equal(mainRef?.sha, expectedHead, 'Main changed after review');
+              assert.equal(mainRef?.type, 'commit', 'Main must reference a commit');
+              const nonMain = normalized.filter(r => r.ref !== `refs/heads/${plan.branch}` && r.ref !== `refs/tags/${plan.newTag}`);
+              assert.equal(sha256(JSON.stringify(nonMain)), plan.nonMainRefsSha256, 'Public refs changed after backup');
+              const added = normalized.find(r => r.ref === `refs/tags/${plan.newTag}`);
+              if (addedTagSha) assert.equal(added?.sha, addedTagSha, 'New tag changed concurrently');
+              else assert.equal(added, undefined, 'New version tag already exists');
+              assert.equal(normalized.length, plan.refNames.length + (addedTagSha ? 1 : 0), 'Unexpected public refs');
+              return normalized;
+            };
+            const assertArtifacts = (release, uploader) => {
+              assert.equal(release.assets.length, plan.artifacts.length, 'Unexpected release asset count');
+              for (const expected of plan.artifacts) {
+                const actual = release.assets.find(a => a.name === expected.name);
+                assert.ok(actual, 'A reviewed artifact is missing');
+                assert.equal(actual.size, expected.size, 'Artifact size changed');
+                assert.equal(actual.digest, `sha256:${expected.sha256}`, 'Artifact digest changed');
+                assert.equal(actual.state, 'uploaded', 'Artifact upload is incomplete');
+                if (uploader) assert.equal(actual.uploader.login, uploader, 'Asset uploader is not the automated publisher');
+              }
+            };
+            const repository = await api('');
+            assert.equal(repository.id, plan.repositoryId, 'Repository identity changed');
+            assert.equal(repository.full_name, repo, 'Repository owner/name changed');
+            assert.equal(repository.default_branch, plan.branch, 'Default branch changed');
+            assert.equal(repository.private, false, 'Expected the existing public release repository');
+            const baselineRefs = assertBaselineRefs(await getRefs());
+            const releases = await api('/releases?per_page=100');
+            assert.deepEqual(releases.filter(r => !r.draft).map(r => r.id).sort((a, b) => a - b),
+              plan.legacyReleases.map(r => r.id).sort((a, b) => a - b), 'Published releases changed since backup');
+            for (const expected of plan.legacyReleases) {
+              const current = releases.find(r => r.id === expected.id);
+              assert.ok(current, 'A backed-up release is missing');
+              assert.equal(sha256(JSON.stringify(releaseSnapshot(current))), expected.snapshotSha256, 'Backed-up release metadata changed');
+              assert.equal(current.immutable, false, 'A release became immutable');
+            }
+            await api(`/releases/tags/${encodeURIComponent(plan.newTag)}`, 'GET', undefined, 404);
+            const stagingCandidates = releases.filter(r => r.draft && r.name === plan.stagingReleaseName);
+            assert.equal(stagingCandidates.length, 1, 'Expected exactly one reviewed staging draft');
+            const staging = stagingCandidates[0];
+            assert.ok(staging.tag_name === plan.stagingTag || /^untagged-[0-9a-f]+$/.test(staging.tag_name), 'Wrong staging draft tag');
+            assert.equal(staging.draft, true, 'Staging must remain private');
+            assert.equal(staging.prerelease, false, 'Unexpected staging release mode');
+            assert.ok(!plan.legacyReleases.some(r => r.id === staging.id), 'Staging overlaps a legacy release');
+            assertArtifacts(staging);
+            const currentCommit = await api(`/git/commits/${expectedHead}`);
+            const currentTree = await api(`/git/trees/${currentCommit.tree.sha}?recursive=1`);
+            assert.equal(currentTree.truncated, false, 'Tree was truncated');
+            assert.deepEqual(currentTree.tree.filter(e => e.type === 'blob').map(e => e.path).sort(),
+              plan.allowedPublicFiles.slice().sort(), 'Unexpected public source files');
+            const work = await fsp.mkdtemp(path.join(os.tmpdir(), 'aovision-privacy-'));
+            const files = new Map();
+            try {
+              // Every staged file is downloaded and hashed before the first mutation.
+              for (const expected of plan.artifacts) {
+                const asset = staging.assets.find(a => a.name === expected.name);
+                let response = await fetch(`${apiRoot}/releases/assets/${asset.id}`, {
+                  headers: { ...headers, Accept: 'application/octet-stream' }, redirect: 'manual' });
+                for (let redirects = 0; response.status >= 300 && response.status < 400; redirects++) {
+                  assert.ok(redirects < 5, 'Excessive download redirects');
+                  const next = new URL(response.headers.get('location'));
+                  assert.equal(next.protocol, 'https:', 'Insecure download redirect');
+                  assert.ok(next.hostname === 'github.com' || next.hostname.endsWith('.githubusercontent.com'), 'Unexpected asset download host');
+                  // Signed download links are followed without the repository token and never logged.
+                  response = await fetch(next, { redirect: 'manual' });
+                }
+                assert.ok(response.ok && response.body, 'Staging download failed');
+                let size = 0;
+                const digest = crypto.createHash('sha256');
+                const meter = new Transform({ transform(chunk, encoding, callback) {
+                  size += chunk.length;
+                  if (size > expected.size) return callback(new Error('Staged artifact is larger than reviewed'));
+                  digest.update(chunk); callback(null, chunk);
+                } });
+                const filename = path.join(work, expected.name);
+                await pipeline(Readable.fromWeb(response.body), meter, fs.createWriteStream(filename, { flags: 'wx' }));
+                assert.equal(size, expected.size, 'Staged artifact byte count differs');
+                assert.equal(digest.digest('hex'), expected.sha256, 'Staged artifact bytes differ');
+                files.set(expected.name, filename);
+              }
+              assertBaselineRefs(await getRefs());
+              console.log('Preflight passed: repository, complete backups, exact refs, release metadata, and all staged artifact bytes.');
+          
+              stage = 'create clean publication objects';
+              const readme = await api('/git/blobs', 'POST', { content: plan.readmeMarkdown, encoding: 'utf-8' });
+              const tree = await api('/git/trees', 'POST', { base_tree: currentCommit.tree.sha,
+                tree: [{ path: 'README.md', mode: '100644', type: 'blob', sha: readme.sha }] });
+              const identity = { name: 'AOVision', email: '41898282+github-actions[bot]@users.noreply.github.com', date: new Date().toISOString() };
+              const clean = await api('/git/commits', 'POST', { message: 'Publish AOVision release information',
+                tree: tree.sha, parents: [], author: identity, committer: identity });
+              assert.equal(clean.parents.length, 0, 'Clean publication commit must be parentless');
+              await api('/git/refs', 'POST', { ref: `refs/tags/${plan.newTag}`, sha: clean.sha });
+              const created = await api('/releases', 'POST', { tag_name: plan.newTag, target_commitish: clean.sha,
+                name: plan.releaseName, body: plan.releaseBody, draft: true, prerelease: false, make_latest: 'false' });
+              assert.equal(created.author.login, plan.publisherLogin, 'Release was not created by the automated publisher');
+              for (const artifact of plan.artifacts) {
+                const response = await fetch(`https://uploads.github.com/repos/${repo}/releases/${created.id}/assets?name=${encodeURIComponent(artifact.name)}`, {
+                  method: 'POST', headers: { ...headers, 'Content-Type': 'application/octet-stream', 'Content-Length': String(artifact.size) },
+                  body: await fsp.readFile(files.get(artifact.name)) });
+                assert.ok(response.ok, `Asset upload failed (${response.status})`);
+              }
+              const prepared = await api(`/releases/${created.id}`);
+              assert.equal(prepared.draft, true, 'New release must stay private until verification');
+              assert.equal(prepared.author.login, plan.publisherLogin, 'Unexpected new release author');
+              assertArtifacts(prepared, plan.publisherLogin);
+              console.log('New private bot release has all three exact audited artifacts.');
+          
+              stage = 'atomic public ref cleanup';
+              assertBaselineRefs(await getRefs(), clean.sha);
+              const gitDir = path.join(work, 'publication');
+              await fsp.mkdir(gitDir);
+              const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_COUNT: '1',
+                GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+                GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${process.env.GH_TOKEN}`).toString('base64')}` };
+              const git = args => {
+                try { return execFileSync('git', args, { cwd: gitDir, env: gitEnv, stdio: 'pipe', encoding: 'utf8' }); }
+                catch { throw new Error(`Atomic Git operation failed during ${stage}; original ref leases are enforced`); }
+              };
+              git(['init', '--quiet']);
+              git(['remote', 'add', 'origin', `https://github.com/${repo}.git`]);
+              git(['fetch', '--quiet', '--depth=1', 'origin', `refs/tags/${plan.newTag}`]);
+              const pushArgs = ['push', '--atomic', '--porcelain'];
+              for (const ref of baselineRefs) pushArgs.push(`--force-with-lease=${ref.ref}:${ref.sha}`);
+              pushArgs.push('origin', ...baselineRefs.map(ref => `${clean.sha}:${ref.ref}`));
+              git(pushArgs);
+              const cleanedRefs = stableRefs(await getRefs());
+              assert.deepEqual(cleanedRefs.map(r => r.ref).sort(), [...plan.refNames, `refs/tags/${plan.newTag}`].sort(), 'Unexpected refs after cleanup');
+              assert.ok(cleanedRefs.every(r => r.sha === clean.sha && r.type === 'commit'), 'A public ref still references previous history');
+              console.log('Main and every public version tag now reference parentless branded history.');
+          
+              stage = 'publish verified new release';
+              const published = await api(`/releases/${created.id}`, 'PATCH', { draft: false, prerelease: false, make_latest: 'true' });
+              assert.equal(published.draft, false, 'New release did not publish');
+              assert.equal(published.author.login, plan.publisherLogin, 'Published release author differs');
+              assertArtifacts(published, plan.publisherLogin);
+              const latest = await api('/releases/latest');
+              assert.equal(latest.id, created.id, 'The verified release is not Latest');
+              const feedResponse = await fetch(`https://github.com/${repo}/releases/latest/download/latest.yml`);
+              assert.ok(feedResponse.ok, 'Public current update manifest is unavailable');
+              assert.equal(sha256(Buffer.from(await feedResponse.arrayBuffer())),
+                plan.artifacts.find(a => a.name === 'latest.yml').sha256, 'Public current update manifest differs');
+              console.log('Published bot release and public branded update manifest verified.');
+          
+              stage = 'reversibly hide legacy releases';
+              for (const legacy of plan.legacyReleases) {
+                const current = await api(`/releases/${legacy.id}`);
+                assert.equal(sha256(JSON.stringify(releaseSnapshot(current))), legacy.snapshotSha256, 'Legacy release changed concurrently');
+                const hidden = await api(`/releases/${legacy.id}`, 'PATCH', { draft: true });
+                assert.equal(hidden.draft, true, 'A legacy release remains public');
+              }
+              const finalReleases = await api('/releases?per_page=100');
+              assert.deepEqual(finalReleases.filter(r => !r.draft).map(r => r.id), [created.id], 'Unexpected public releases remain');
+              assert.equal(finalReleases.find(r => r.id === staging.id)?.draft, true, 'Staging draft changed');
+              assert.equal((await api('/releases/latest')).id, created.id, 'Latest changed during legacy cleanup');
+              const result = { result: 'passed', repositoryId: plan.repositoryId, version: plan.version,
+                releaseId: created.id, releaseUrl: published.html_url, cleanCommit: clean.sha,
+                legacyReleasesRetainedAsPrivateDrafts: plan.legacyReleases.map(r => r.id),
+                privateStagingReleaseRetained: staging.id, publicRefsCleaned: cleanedRefs.length,
+                automatedAuthorAndUploadersVerified: true, auditedAssetDigestsVerified: true,
+                brandedUpdateManifestVerified: true, cachedOldCommitRemovalGuaranteed: false,
+                bootstrapWorkflowRunCleanupStillRequired: true, installedUpgradeVerified: false };
+              console.log(JSON.stringify(result, null, 2));
+              if (process.env.GITHUB_STEP_SUMMARY) await fsp.appendFile(process.env.GITHUB_STEP_SUMMARY,
+                `AOVision ${plan.version} privacy migration completed. Release: ${published.html_url}\n\n` +
+                'Legacy releases remain private drafts. Cached historic commits and the bootstrap Actions run require separate review.\n');
+            } finally {
+              // This removes only the unique, absolute temporary directory allocated above.
+              await fsp.rm(work, { recursive: true, force: true });
+            }
+          }
+          
+          if (require.main === module) main().catch(error => {
+            console.error(`Privacy migration stopped: ${error.message}`);
+            process.exitCode = 1;
+          });
+          
+          module.exports = { releaseSnapshot, stableRefs, sha256 };
+          AOVISION_MIGRATION_CODE
+          cat > privacy-plan.json <<'AOVISION_MIGRATION_PLAN'
+          {
+            "schemaVersion": 1,
+            "repository": "AOVisionApp/aovision-releases",
+            "repositoryId": 1410832889,
+            "branch": "main",
+            "version": "1.2.5",
+            "newTag": "v1.2.5",
+            "stagingTag": "privacy-staging-1.2.5",
+            "stagingReleaseName": "AOVision 1.2.5 — Private publishing stage",
+            "publisherLogin": "github-actions[bot]",
+            "approvalPhrase": "PUBLISH AOVISION 1.2.5 AND CLEAN PUBLIC RELEASE HISTORY",
+            "backup": {
+              "publicMetadataSha256": "4b8e1f08947d195f459145a2be7783dc8dc041f48cc30cf53a4a08e1ae0aace4",
+              "refsSnapshotSha256": "4c9888f38331a021a2336ccaa615ce4e511ccaae0dd9fc7a2367860bfb25853e",
+              "verifiedAssetsSha256": "a1adeb73d0c0bef765ef8aa5925dbd334946525e302ea3b3721e35674d4cefd8",
+              "verifiedAssetCount": 21,
+              "newReleaseAuditSha256": "e087e80d49c56472c277c08b5b22a17fa19edb9f5b10e8f058a26951eeb8f029",
+              "attestationSha256": "bdf709c92bab66b3829d674cdecacca8776229b81538e16f5bfef6ed0b2d68b7"
+            },
+            "refNames": [
+              "refs/heads/main",
+              "refs/tags/v1.1.0",
+              "refs/tags/v1.1.1",
+              "refs/tags/v1.2.0",
+              "refs/tags/v1.2.1",
+              "refs/tags/v1.2.2",
+              "refs/tags/v1.2.3",
+              "refs/tags/v1.2.4"
+            ],
+            "nonMainRefsSha256": "fcf0391fc9ed36673c8c5310a8b402497453f09824ce66cac5bbd5024a8ba8fa",
+            "allowedPublicFiles": [
+              "README.md",
+              ".github/workflows/publish-privacy-release.yml"
+            ],
+            "legacyReleases": [
+              {
+                "id": 424584357,
+                "tag": "v1.2.4",
+                "snapshotSha256": "14d2b10f8d7af4e3336dee27b76ce754d278c5e5575972a65bf2242782594550"
+              },
+              {
+                "id": 408487177,
+                "tag": "v1.2.3",
+                "snapshotSha256": "9ddc00173ddba2fad2ed4eea28595d000c3f3bc853ada22fc7987876e2fe7e7a"
+              },
+              {
+                "id": 408337821,
+                "tag": "v1.2.2",
+                "snapshotSha256": "9222ea3085c5341210a8ab6aac351a61da9aea6c50ce41638c12340c146b4b92"
+              },
+              {
+                "id": 408201594,
+                "tag": "v1.2.1",
+                "snapshotSha256": "ceac331bb43122ebd9a17377b3de61b62ceb14a747020f7db45d996b14540895"
+              },
+              {
+                "id": 407397045,
+                "tag": "v1.2.0",
+                "snapshotSha256": "2b685178e94f57e2f4b3403f3c158bbccbb7fdf29f797b3c1ae4c73425f73388"
+              },
+              {
+                "id": 407289742,
+                "tag": "v1.1.1",
+                "snapshotSha256": "817061013b51ed5f3710bac53d1baa4de7ccbd762675b11c45d2e451a1b5ccf1"
+              },
+              {
+                "id": 407199625,
+                "tag": "v1.1.0",
+                "snapshotSha256": "42c6df0cf2855314b28d790717448dcd405c528179d02e854a2597404cf927f7"
+              }
+            ],
+            "artifacts": [
+              {
+                "name": "AOVision-Setup-1.2.5-x64.exe",
+                "size": 160387520,
+                "sha256": "e2018cb94ce259e03975feba03039a7754980a0d96eb3fa9fdb9fb0b0560e09d"
+              },
+              {
+                "name": "AOVision-Setup-1.2.5-x64.exe.blockmap",
+                "size": 166051,
+                "sha256": "8cdd991a51419a2fca9aaafd4078937f29f0c6c02a8b19a86ad4a978fe08f1b3"
+              },
+              {
+                "name": "latest.yml",
+                "size": 1223,
+                "sha256": "4ae4484a15a1fd430ee6ae5f5393c3a168eff467d6daf6055a0d0617c7386a14"
+              }
+            ],
+            "releaseName": "AOVision 1.2.5 — Privacy maintenance",
+            "releaseBody": "# AOVision 1.2.5\n\nThis privacy maintenance build keeps build-machine account paths out of distributed catalog metadata. Catalog provenance retains the source filename and its existing checksum.\n\nThis release and its uploaded files are published by AOVision automation. Download and update addresses remain under AOVisionApp. Existing installations can continue using their original update route. Application identity and saved-settings locations are unchanged.\n\nStop the radar, then choose **Check for updates → Download update → Install and restart** in the launcher.\n\nThe Windows installer remains unsigned, and new subscription purchases remain closed. An installed upgrade and restart have not been verified in a disposable Windows environment. Experimental Detector arrival directions remain estimates; mounted accuracy remains unvalidated.\n",
+            "readmeMarkdown": "# AOVision for Windows\n\nAOVision provides a configurable radar overlay for Albion Online. This public\nrepository is reserved for Windows installers and update files.\n\n## Prelaunch status\n\nThe [latest published Windows installer](https://github.com/AOVisionApp/aovision-releases/releases/latest)\nis AOVision 1.2.5, an unsigned prelaunch privacy maintenance build published by\nAOVision automation. It keeps build-machine account paths out of distributed catalog metadata. The original update route remains available for existing installations.\nAn isolated check using the preserved 1.2.3 updater successfully found and\ndownloaded 1.2.4 through that route with checksum verification. The branded feed\nalso correctly reported version 1.2.4 up to date during that check. See the\n[1.2.5 release details](https://github.com/AOVisionApp/aovision-releases/releases/tag/v1.2.5).\nAOVision includes independent\nRadar, Players and Broad Player Detector overlays with saved layouts, per-window\nRadar Mode and a shared Settings window. It adds a filtered live detector count,\nbrief arrival flashes, a shared electronic sound alert and the integrated Inspector.\nColored solo/group tracking marks remain available. Remembered arrival directions\nand distances are uncertain guesses; they do not track player positions.\nMounted estimates remain experimental.\nDiscord sign-in and verified Admin access have passed online checks. New subscription purchases remain closed.\n\n[Releases](https://github.com/AOVisionApp/aovision-releases/releases) contain\ndownloads and release notes. Installed users can open the launcher, stop the radar,\nthen choose **Check for updates → Download update → Install and restart**.\nInstalled upgrade and restart verification remains pending.\n\n## Requirements\n\n- Windows 10 or 11, 64-bit.\n- Npcap with WinPcap compatibility enabled.\n- Administrator permission for packet capture.\n- Albion Online running in borderless windowed fullscreen.\n- Internet access for Discord sign-in and verified account access.\n\n## Account access\n\nThe launcher requires a signed-in account with verified access before starting\nthe radar. A download alone does not grant a license or subscription. Approved\nAdmin accounts can sign in during setup. Check the latest release notes for account-service availability.\n\nWebsite: [AOVision](https://aovision.pages.dev).\nSupport: [AOVisionApp@gmail.com](mailto:AOVisionApp@gmail.com).\n",
+            "effects": {
+              "publicHistoryBecomesParentless": true,
+              "allVersionTagsUseCurrentReleaseInformation": true,
+              "legacyReleasesBecomePrivateDrafts": true,
+              "legacyPinnedPublicDownloadsBecomeUnavailable": true,
+              "legacyLatestUpdateRoutePreservedByRepositoryIdentity": true,
+              "repositoryRenameOrTransfer": false,
+              "deletesReleaseAssets": false,
+              "deletesReleases": false,
+              "stagingRemainsPrivateDraft": true,
+              "bootstrapActionsRunCleanupSeparate": true,
+              "cachedHistoricObjectsCannotBeGuaranteedRemoved": true,
+              "installerRemainsUnsigned": true,
+              "installedUpgradeVerified": false
+            },
+            "rollback": {
+              "localGitMirror": "github-migration/privacy-backup/repository.git",
+              "originalRefs": "github-migration/privacy-backup/refs-before.json",
+              "originalReleaseMetadata": "github-migration/privacy-backup/public-metadata-before.json",
+              "verifiedOriginalAssets": "github-migration/privacy-backup/verified-assets.json",
+              "historyRefsCanBeRestoredFromMirror": true,
+              "oldReleasesCanBeRepublishedFromDrafts": true,
+              "deletedActionsRunsCannotBeRestored": true
+            }
+          }
+          AOVISION_MIGRATION_PLAN
+          node privacy-migration.cjs --apply privacy-plan.json
