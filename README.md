@@ -6,13 +6,13 @@ repository is reserved for Windows installers and update files.
 ## Download and setup
 
 The [Windows installer](https://aovision.pages.dev/download) downloads directly.
-AOVision 1.2.8 adds guided computer setup to its installer and launcher. Missing
+AOVision 1.2.9 adds polished guided setup and the new AOVision logo. Missing
 Npcap and WinPcap compatibility receive clear instructions and a direct download
-from the driver's publisher. Finish Npcap's installer, then choose Check again.
+from the driver's publisher. Finish Npcap's installer, then choose Check installation.
 The driver is not bundled or silently installed. AOVision includes its app runtime;
 customers do not need Node.js, Python, or development tools.
 The original update route remains available for existing installations.
-See the [1.2.8 release details](https://github.com/AOVisionApp/aovision-releases/releases/tag/v1.2.8).
+See the [1.2.9 release details](https://github.com/AOVisionApp/aovision-releases/releases/tag/v1.2.9).
 AOVision includes independent
 Radar, Players and Broad Player Detector overlays with saved layouts, per-window
 Radar Mode and a shared Settings window. It adds a filtered live detector count,
@@ -45,7 +45,7 @@ See the [terms and billing policy](https://aovision.pages.dev/terms.html).
 [Releases](https://github.com/AOVisionApp/aovision-releases/releases) contain
 downloads and release notes. Installed users can open the launcher, stop the radar,
 then choose **Check for updates → Download update → Install and restart**.
-Version 1.2.8's installed upgrade/restart has not been independently exercised.
+Version 1.2.9's installed upgrade/restart has not been independently exercised.
 
 ## Requirements
 
