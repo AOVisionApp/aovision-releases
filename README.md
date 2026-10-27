@@ -6,12 +6,12 @@ repository is reserved for Windows installers and update files.
 ## Prelaunch status
 
 The [latest published Windows installer](https://github.com/AOVisionApp/aovision-releases/releases/latest)
-is AOVision 1.2.6, an unsigned prelaunch build published by AOVision automation
+is AOVision 1.2.7, an unsigned prelaunch build published by AOVision automation
 with branded download and update addresses. This update supports the new access
 plans and card-required one-day trials, and removes the unused legacy
 creature-catalog contribution feature.
 The original update route remains available for existing installations.
-See the [1.2.6 release details](https://github.com/AOVisionApp/aovision-releases/releases/tag/v1.2.6).
+See the [1.2.7 release details](https://github.com/AOVisionApp/aovision-releases/releases/tag/v1.2.7).
 AOVision includes independent
 Radar, Players and Broad Player Detector overlays with saved layouts, per-window
 Radar Mode and a shared Settings window. It adds a filtered live detector count,
