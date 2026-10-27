@@ -3,15 +3,16 @@
 AOVision provides a configurable radar overlay for Albion Online. This public
 repository is reserved for Windows installers and update files.
 
-## Prelaunch status
+## Download and setup
 
-The [latest published Windows installer](https://github.com/AOVisionApp/aovision-releases/releases/latest)
-is AOVision 1.2.7, an unsigned prelaunch build published by AOVision automation
-with branded download and update addresses. This update supports the new access
-plans and card-required one-day trials, and removes the unused legacy
-creature-catalog contribution feature.
+The [Windows installer](https://aovision.pages.dev/download) downloads directly.
+AOVision 1.2.8 adds guided computer setup to its installer and launcher. Missing
+Npcap and WinPcap compatibility receive clear instructions and a direct download
+from the driver's publisher. Finish Npcap's installer, then choose Check again.
+The driver is not bundled or silently installed. AOVision includes its app runtime;
+customers do not need Node.js, Python, or development tools.
 The original update route remains available for existing installations.
-See the [1.2.7 release details](https://github.com/AOVisionApp/aovision-releases/releases/tag/v1.2.7).
+See the [1.2.8 release details](https://github.com/AOVisionApp/aovision-releases/releases/tag/v1.2.8).
 AOVision includes independent
 Radar, Players and Broad Player Detector overlays with saved layouts, per-window
 Radar Mode and a shared Settings window. It adds a filtered live detector count,
@@ -19,9 +20,12 @@ brief arrival flashes, a shared electronic sound alert and the integrated Inspec
 Colored solo/group tracking marks remain available. Remembered arrival directions
 and distances are uncertain guesses; they do not track player positions.
 Mounted estimates remain experimental.
-Discord sign-in, an eligible card-required 24-hour trial, and self-service
-scheduled cancellation passed an online test-mode check. New purchases and
-trials remain closed until launch; downloading does not grant access.
+New purchases and eligible trials are live in the United States and supported
+billing countries listed in the launcher. Sign in with Discord, finish computer
+setup, select your actual billing country and plan, then complete checkout.
+Return to the launcher, refresh access and choose Launch radar. On first launch,
+select the Wi-Fi or Ethernet adapter used for the game. Downloading alone does
+not grant radar access. The installer is unsigned.
 
 ## Access plans
 
@@ -29,17 +33,19 @@ trials remain closed until launch; downloading does not grant access.
 - Monthly: **$14.99 USD/month**, renewing until canceled.
 - Lifetime: **$149.99 USD once**, with no recurring renewal or scheduled access expiry.
 
-When purchases open, eligible accounts can start one 24-hour trial on weekly or
+Eligible accounts can start one 24-hour trial on weekly or
 monthly access. A card is required, and the selected plan charges automatically
 afterward unless canceled before its deadline. Lifetime has no trial. Online
 account verification remains required; refunds, disputes, account restrictions
 or account deletion can end access. Existing subscriptions keep their agreed
-billing terms. See the [terms and billing policy](https://aovision.pages.dev/terms.html).
+billing terms. Applicable tax is added at checkout. New purchases use Stripe
+Managed Payments; Manage billing opens Link for those purchases.
+See the [terms and billing policy](https://aovision.pages.dev/terms.html).
 
 [Releases](https://github.com/AOVisionApp/aovision-releases/releases) contain
 downloads and release notes. Installed users can open the launcher, stop the radar,
 then choose **Check for updates → Download update → Install and restart**.
-Installed upgrade and restart verification remains pending.
+Version 1.2.8's installed upgrade/restart has not been independently exercised.
 
 ## Requirements
 
